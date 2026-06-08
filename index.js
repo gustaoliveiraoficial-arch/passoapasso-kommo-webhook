@@ -21,7 +21,7 @@ const ETAPA = {
   LEAD_FRIO:        103109843,
 };
 
-const BASE = `https://${SUBDOMAIN}.kommo.com/api/v4`;
+const BASE = `https://api-c.kommo.com/api/v4`;
 const hdrs = () => ({ Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' });
 
 // ─── SYSTEM PROMPT DA ATENDENTE ANA ────────────────────────────────────────

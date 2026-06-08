@@ -91,29 +91,52 @@ async function getTalkByLead(leadId) {
   return talk;
 }
 
-async function getMensagens(talkId) {
-  const r = await fetch(`${BASE}/talks/${talkId}/messages?limit=20`, { headers: hdrs() });
-  if (!r.ok) {
-    const body = await r.text().catch(() => '');
-    console.error(`[KOMMO] getMensagens talk ${talkId} HTTP ${r.status} — ${body.substring(0, 200)}`);
+async function getMensagens(talkId, chatId) {
+  // Tenta via chatId primeiro (endpoint alternativo)
+  if (chatId) {
+    const r = await fetch(`${BASE}/chats/${chatId}/messages?limit=20`, { headers: hdrs() });
+    if (r.ok) {
+      const d = await r.json();
+      return d._embedded?.messages || [];
+    }
+    const errBody = await r.text().catch(() => '');
+    console.error(`[KOMMO] getMensagens via chatId ${chatId} HTTP ${r.status} — ${errBody.substring(0, 200)}`);
+  }
+  // Fallback: via talkId
+  const r2 = await fetch(`${BASE}/talks/${talkId}/messages?limit=20`, { headers: hdrs() });
+  if (!r2.ok) {
+    const body = await r2.text().catch(() => '');
+    console.error(`[KOMMO] getMensagens via talkId ${talkId} HTTP ${r2.status} — ${body.substring(0, 200)}`);
     return [];
   }
-  const d = await r.json();
-  return d._embedded?.messages || [];
+  const d2 = await r2.json();
+  return d2._embedded?.messages || [];
 }
 
-async function enviarMensagem(talkId, texto) {
+async function enviarMensagem(talkId, chatId, texto) {
   const payload = { text: texto, author_id: BOT_USER_ID };
-  const r = await fetch(`${BASE}/talks/${talkId}/messages`, {
+
+  // Tenta via chatId primeiro
+  if (chatId) {
+    const r = await fetch(`${BASE}/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: hdrs(),
+      body: JSON.stringify(payload)
+    });
+    if (r.ok) return true;
+    const errBody = await r.text().catch(() => '');
+    console.error(`[SEND] chatId ${chatId} HTTP ${r.status} — ${errBody.substring(0, 300)}`);
+  }
+
+  // Fallback: via talkId
+  const r2 = await fetch(`${BASE}/talks/${talkId}/messages`, {
     method: 'POST',
     headers: hdrs(),
     body: JSON.stringify(payload)
   });
-
-  if (r.ok) return true;
-
-  const errBody = await r.text().catch(() => '');
-  console.error(`[SEND] talk ${talkId} HTTP ${r.status} — ${errBody.substring(0, 300)}`);
+  if (r2.ok) return true;
+  const errBody2 = await r2.text().catch(() => '');
+  console.error(`[SEND] talkId ${talkId} HTTP ${r2.status} — ${errBody2.substring(0, 300)}`);
   return false;
 }
 
@@ -196,9 +219,9 @@ async function processarLead(leadId) {
     return;
   }
 
-  console.log(`[PROC] Talk encontrado: ${talk.talk_id}`);
+  console.log(`[PROC] Talk encontrado: ${talk.talk_id} | chat_id: ${talk.chat_id}`);
 
-  const mensagens = await getMensagens(talk.talk_id);
+  const mensagens = await getMensagens(talk.talk_id, talk.chat_id);
   console.log(`[PROC] Mensagens encontradas: ${mensagens.length}`);
   if (!mensagens.length) return;
 
@@ -225,7 +248,7 @@ async function processarLead(leadId) {
 
   console.log(`[IA] Resposta: acao=${resposta.acao} | msg="${resposta.mensagem.substring(0, 80)}"`);
 
-  const enviado = await enviarMensagem(talk.talk_id, resposta.mensagem);
+  const enviado = await enviarMensagem(talk.talk_id, talk.chat_id, resposta.mensagem);
   console.log(`[SEND] Lead ${leadId} | enviado=${enviado}`);
 
   if (lead.status_id === ETAPA.ENTRADA) {
@@ -360,20 +383,25 @@ app.get('/diagnostico/:leadId', async (req, res) => {
     resultado.etapas.getTalk.talk = talk || null;
 
     if (talk) {
-      // 3. Busca mensagens
-      const r3 = await fetch(`${BASE}/talks/${talk.talk_id}/messages?limit=5`, { headers: hdrs() });
-      resultado.etapas.getMensagens = { status: r3.status };
+      // 3. Busca mensagens via chatId
+      const chatId = talk.chat_id;
+      const r3 = await fetch(`${BASE}/chats/${chatId}/messages?limit=5`, { headers: hdrs() });
+      resultado.etapas.getMensagensChatId = { status: r3.status, chatId };
       if (r3.ok) {
         const d3 = await r3.json();
         const msgs = d3._embedded?.messages || [];
-        resultado.etapas.getMensagens.total = msgs.length;
-        resultado.etapas.getMensagens.ultima = msgs[msgs.length - 1] ? {
+        resultado.etapas.getMensagensChatId.total = msgs.length;
+        resultado.etapas.getMensagensChatId.ultima = msgs[msgs.length - 1] ? {
           author_type: msgs[msgs.length - 1].author_type,
           text: (msgs[msgs.length - 1].text || '').substring(0, 100)
         } : null;
       } else {
-        resultado.etapas.getMensagens.erro = await r3.text().catch(() => '');
+        resultado.etapas.getMensagensChatId.erro = await r3.text().catch(() => '');
       }
+      // 4. Fallback via talkId
+      const r4 = await fetch(`${BASE}/talks/${talk.talk_id}/messages?limit=5`, { headers: hdrs() });
+      resultado.etapas.getMensagensTalkId = { status: r4.status };
+      if (!r4.ok) resultado.etapas.getMensagensTalkId.erro = await r4.text().catch(() => '');
     }
   } else {
     resultado.etapas.getTalk.erro = await r2.text().catch(() => '');

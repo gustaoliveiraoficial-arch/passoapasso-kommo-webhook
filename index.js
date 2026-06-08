@@ -5,190 +5,325 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
-const SUBDOMAIN   = 'passoapassouniformes2025';
-const TOKEN       = process.env.KOMMO_TOKEN;
-const PIPELINE_ID = 13368211;
-const ETAPA_ENTRADA = 103109571; // "Etapa de leads de entrada"
+const SUBDOMAIN       = 'passoapassouniformes2025';
+const TOKEN           = process.env.KOMMO_TOKEN;
+const OPENROUTER_KEY  = process.env.OPENROUTER_API_KEY;
+const PIPELINE_ID     = 13368211;
+const BOT_USER_ID = 14977039; // Conta "Passo a passo uniformes"
 
-// IDs das etapas no funil principal
+// Etapas do Funil de Vendas
 const ETAPA = {
-  empresarial: 105468287,
-  fitness:     105468291,
-  formandos:   105468295,
-  futebol:     105468231,
-  inverno:     105468299,
-  menos10:     105468303,
+  ENTRADA:          103109571, // Etapa de leads de entrada
+  PRIMEIRO_CONTATO: 103109831, // Primeiro Contato
+  QUALIFICADO:      103109847, // Qualificado
+  LEAD_FRIO:        103109843, // Lead Frio
 };
 
-// ─── MAPEAMENTO DE PALAVRAS-CHAVE ──────────────────────────────────────────
-const REGRAS = [
-  { keywords: ['linha empresarial', 'empresarial'],                                etapa: 'empresarial' },
-  { keywords: ['linha fitness', 'fitness'],                                         etapa: 'fitness'     },
-  { keywords: ['linha formandos', 'formandos', 'formatura'],                        etapa: 'formandos'   },
-  { keywords: ['linha futebol', 'futebol', 'time de futebol', 'fut'],               etapa: 'futebol'     },
-  { keywords: ['linha inverno', 'inverno', 'moletom', 'jaqueta', 'blusa de frio'],  etapa: 'inverno'     },
-  { keywords: ['menos de 10', 'menos que 10', 'menos de dez', 'só 1 peça',
-               'só 2 peças', 'só 3 peças', 'avulso', 'unidade', 'peça avulsa'],     etapa: 'menos10'     },
-];
-
-function detectarEtapa(texto) {
-  if (!texto) return null;
-  const lower = texto.toLowerCase();
-  for (const regra of REGRAS) {
-    if (regra.keywords.some(kw => lower.includes(kw))) return regra.etapa;
-  }
-  return null;
-}
-
-// ─── FUNÇÕES DA API KOMMO ──────────────────────────────────────────────────
-const headers = () => ({ Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' });
 const BASE = `https://${SUBDOMAIN}.kommo.com/api/v4`;
+const hdrs = () => ({ Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' });
 
-async function getLead(leadId) {
-  const res = await fetch(`${BASE}/leads/${leadId}?with=notes`, { headers: headers() });
-  return res.json();
+// ─── SYSTEM PROMPT DA ATENDENTE ANA ────────────────────────────────────────
+const SYSTEM_PROMPT = `
+Você é a Ana, atendente virtual da PassoaPasso Uniformes — empresa especializada em uniformes personalizados de qualidade.
+
+Nossas linhas:
+- Empresarial: camisas polo, camisetas, uniformes corporativos
+- Fitness: leggings, tops, bermudas, conjuntos fitness
+- Formandos: camisetas e moletons de turma/formatura
+- Futebol: camisas, shorts e conjuntos esportivos
+- Inverno: moletons, jaquetas, blusas de frio personalizadas
+
+REGRAS DE ATENDIMENTO:
+- Seja cordial, natural e objetiva. Máximo 3 frases curtas por resposta.
+- Não use asteriscos nem emojis em excesso (1 por mensagem no máximo).
+- Nunca faça mais de 2 perguntas de uma vez.
+- Seu objetivo é qualificar: coletar tipo, quantidade, prazo e se tem arte/logo.
+- Pedido mínimo: 10 peças. Se quantidade < 10, use ação "sem_perfil".
+- Quando tiver tipo + quantidade (≥10) + prazo: use ação "qualificado".
+- Após qualificar: avise que um consultor entrará em contato em breve.
+
+RESPONDA SEMPRE EM JSON PURO (sem markdown, sem blocos de código):
+{
+  "mensagem": "texto da resposta para o cliente",
+  "acao": "continuar" | "qualificado" | "sem_perfil",
+  "dados": {
+    "tipo": "empresarial" | "fitness" | "formandos" | "futebol" | "inverno" | null,
+    "quantidade": numero_inteiro_ou_null,
+    "prazo": "descrição do prazo ou null",
+    "tem_arte": true | false | null
+  }
 }
 
-async function getTalkMessages(talkId) {
-  const res = await fetch(`${BASE}/talks/${talkId}/messages?limit=10`, { headers: headers() });
-  if (!res.ok) return [];
-  const data = await res.json();
-  return data._embedded?.messages || [];
+FLUXO SUGERIDO:
+1. Saudação + pergunta sobre o que procuram
+2. Identificar tipo de uniforme
+3. Quantidade de peças (se <10 → sem_perfil com mensagem gentil)
+4. Prazo de entrega necessário
+5. Se tem arte/logo pronto ou precisa criar
+6. Quando qualificado → mensagem de encerramento + avisar que consultor vai entrar em contato
+`.trim();
+
+// ─── FUNÇÕES DA API KOMMO ───────────────────────────────────────────────────
+async function getLead(leadId) {
+  const r = await fetch(`${BASE}/leads/${leadId}`, { headers: hdrs() });
+  if (!r.ok) { console.error(`[KOMMO] getLead ${leadId} HTTP ${r.status}`); return null; }
+  return r.json();
 }
 
 async function getTalkByLead(leadId) {
-  const res = await fetch(`${BASE}/talks?filter[entity_id]=${leadId}&filter[entity_type]=lead&limit=1`, { headers: headers() });
-  if (!res.ok) return null;
-  const data = await res.json();
-  return data._embedded?.talks?.[0] || null;
+  const r = await fetch(`${BASE}/talks?filter[entity_id]=${leadId}&filter[entity_type]=lead&limit=1`, { headers: hdrs() });
+  if (!r.ok) return null;
+  const d = await r.json();
+  return d._embedded?.talks?.[0] || null;
 }
 
-async function moverParaEtapa(leadId, etapaKey) {
-  const statusId = ETAPA[etapaKey];
-  const res = await fetch(`${BASE}/leads/${leadId}`, {
+async function getMensagens(talkId) {
+  const r = await fetch(`${BASE}/talks/${talkId}/messages?limit=20`, { headers: hdrs() });
+  if (!r.ok) { console.error(`[KOMMO] getMensagens talk ${talkId} HTTP ${r.status}`); return []; }
+  const d = await r.json();
+  return d._embedded?.messages || [];
+}
+
+async function enviarMensagem(talkId, texto) {
+  // Endpoint para enviar mensagem na conversa
+  const r = await fetch(`${BASE}/talks/${talkId}/messages`, {
+    method: 'POST',
+    headers: hdrs(),
+    body: JSON.stringify({ text: texto, author_id: BOT_USER_ID })
+  });
+
+  if (r.ok) return true;
+
+  const errBody = await r.text().catch(() => '');
+  console.error(`[SEND] talk ${talkId} HTTP ${r.status} — ${errBody.substring(0, 200)}`);
+  return false;
+}
+
+async function moverLead(leadId, statusId) {
+  const r = await fetch(`${BASE}/leads/${leadId}`, {
     method: 'PATCH',
-    headers: headers(),
+    headers: hdrs(),
     body: JSON.stringify({ status_id: statusId })
   });
-  console.log(`[MOVE] Lead ${leadId} → "${etapaKey}" (status ${statusId}) | HTTP ${res.status}`);
+  const label = Object.keys(ETAPA).find(k => ETAPA[k] === statusId) || statusId;
+  console.log(`[MOVE] Lead ${leadId} → ${label} (${statusId}) | HTTP ${r.status}`);
 }
 
-// ─── PROCESSAMENTO DE UM LEAD ──────────────────────────────────────────────
-async function processarLead(leadId, textoExtra = '') {
-  const leadData = await getLead(leadId);
+async function salvarNota(leadId, texto) {
+  await fetch(`${BASE}/leads/${leadId}/notes`, {
+    method: 'POST',
+    headers: hdrs(),
+    body: JSON.stringify([{ note_type: 'common', params: { text: texto } }])
+  });
+}
 
-  // Verifica se ainda está na etapa de entrada
-  if (leadData.status_id !== ETAPA_ENTRADA) {
-    console.log(`[SKIP] Lead ${leadId} já está na etapa ${leadData.status_id}`);
+// ─── IA VIA OPENROUTER ──────────────────────────────────────────────────────
+async function consultarIA(historico) {
+  if (!OPENROUTER_KEY) { console.error('[IA] OPENROUTER_API_KEY não configurada'); return null; }
+
+  const mensagens = [{ role: 'system', content: SYSTEM_PROMPT }, ...historico];
+
+  const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${OPENROUTER_KEY}`,
+      'HTTP-Referer': 'https://passoapassouniformes2025.kommo.com',
+      'X-Title': 'Atendente IA Ana'
+    },
+    body: JSON.stringify({
+      model: 'meta-llama/llama-3.3-70b-instruct:free',
+      max_tokens: 600,
+      messages: mensagens
+    })
+  });
+
+  if (!r.ok) {
+    console.error('[IA] OpenRouter', r.status, await r.text().catch(() => ''));
+    return null;
+  }
+
+  const d = await r.json();
+  const texto = d.choices?.[0]?.message?.content?.trim() || '';
+
+  try {
+    return JSON.parse(texto);
+  } catch {
+    const match = texto.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { return JSON.parse(match[0]); } catch { /* ignora */ }
+    }
+    console.error('[IA] JSON inválido:', texto.substring(0, 300));
+    return null;
+  }
+}
+
+// ─── PROCESSAMENTO DO LEAD ──────────────────────────────────────────────────
+async function processarLead(leadId) {
+  const lead = await getLead(leadId);
+  if (!lead) return;
+
+  // Só age nas etapas de entrada e primeiro contato
+  if (![ETAPA.ENTRADA, ETAPA.PRIMEIRO_CONTATO].includes(lead.status_id)) {
+    console.log(`[SKIP] Lead ${leadId} já na etapa ${lead.status_id}`);
     return;
   }
 
-  // Coleta textos: notas + mensagens do talk + texto extra do webhook
-  const notas = leadData._embedded?.notes || [];
-  const textoNotas = notas.map(n => n.params?.text || n.text || '').join(' ');
-
-  // Tenta pegar mensagens do talk (WhatsApp)
-  let textoTalk = '';
   const talk = await getTalkByLead(leadId);
-  if (talk) {
-    const msgs = await getTalkMessages(talk.talk_id);
-    textoTalk = msgs
-      .filter(m => m.author_type === 'contact') // só mensagens do cliente
-      .map(m => m.text || '')
-      .join(' ');
-    console.log(`[TALK] Lead ${leadId} | talk_id ${talk.talk_id} | msg: "${textoTalk.substring(0, 150)}"`);
+  if (!talk) {
+    console.log(`[SKIP] Lead ${leadId} sem conversa no WhatsApp`);
+    return;
   }
 
-  const textoTotal = `${leadData.name || ''} ${textoNotas} ${textoTalk} ${textoExtra}`.trim();
-  console.log(`[ANALISE] Lead ${leadId} | texto total: "${textoTotal.substring(0, 200)}"`);
+  const mensagens = await getMensagens(talk.talk_id);
+  if (!mensagens.length) return;
 
-  const etapaKey = detectarEtapa(textoTotal);
-  if (etapaKey) {
-    await moverParaEtapa(leadId, etapaKey);
-  } else {
-    console.log(`[SEM MATCH] Lead ${leadId} — nenhuma palavra-chave encontrada`);
+  // Verifica se a última mensagem é do cliente (não do bot)
+  const ultima = mensagens[mensagens.length - 1];
+  if (ultima.author_type !== 'contact') {
+    console.log(`[SKIP] Lead ${leadId} — última mensagem já é do bot, aguardando cliente`);
+    return;
+  }
+
+  // Monta histórico para o Claude (últimas 10 mensagens)
+  const historico = mensagens.slice(-10).map(m => ({
+    role: m.author_type === 'contact' ? 'user' : 'assistant',
+    content: m.text || '[mensagem de mídia]'
+  }));
+
+  console.log(`[IA] Lead ${leadId} | talk ${talk.talk_id} | ${historico.length} mensagens`);
+  const resposta = await consultarIA(historico);
+
+  if (!resposta?.mensagem) {
+    console.error(`[IA] Resposta inválida para lead ${leadId}`);
+    return;
+  }
+
+  // Envia a resposta ao cliente
+  const enviado = await enviarMensagem(talk.talk_id, resposta.mensagem);
+  console.log(`[SEND] Lead ${leadId} | ok=${enviado} | ação=${resposta.acao}`);
+
+  // Move para "Primeiro Contato" se ainda está na entrada
+  if (lead.status_id === ETAPA.ENTRADA) {
+    await moverLead(leadId, ETAPA.PRIMEIRO_CONTATO);
+  }
+
+  // Ações pós-resposta
+  if (resposta.acao === 'qualificado') {
+    await moverLead(leadId, ETAPA.QUALIFICADO);
+
+    const dados = resposta.dados || {};
+    const nota = [
+      'Qualificado pela Ana (IA)',
+      dados.tipo        ? `Linha: ${dados.tipo}`             : '',
+      dados.quantidade  ? `Quantidade: ${dados.quantidade} peças` : '',
+      dados.prazo       ? `Prazo: ${dados.prazo}`            : '',
+      dados.tem_arte !== null && dados.tem_arte !== undefined
+        ? `Arte pronta: ${dados.tem_arte ? 'Sim' : 'Nao'}`
+        : '',
+    ].filter(Boolean).join('\n');
+
+    await salvarNota(leadId, nota);
+    console.log(`[QUALIFICADO] Lead ${leadId} movido para Qualificado com nota`);
+  }
+
+  if (resposta.acao === 'sem_perfil') {
+    await moverLead(leadId, ETAPA.LEAD_FRIO);
+    await salvarNota(leadId, 'Lead sem perfil (menos de 10 pecas) — movido para Lead Frio pela Ana (IA)');
+    console.log(`[SEM_PERFIL] Lead ${leadId} movido para Lead Frio`);
   }
 }
 
-// ─── ROTA PRINCIPAL DO WEBHOOK ─────────────────────────────────────────────
+// ─── ROTA WEBHOOK ───────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  res.json({ ok: true }); // responde imediatamente ao Kommo
+  res.json({ ok: true }); // Responde imediatamente ao Kommo
 
   try {
     const body = req.body;
     console.log('[WEBHOOK]', JSON.stringify(body).substring(0, 400));
 
-    // Evento: novo lead adicionado
-    const leadsAdd = body?.leads?.add || [];
-    for (const lead of leadsAdd) {
+    const agendarProcessamento = (leadId, delay = 0) => {
+      if (!leadId) return;
+      const executar = () => processarLead(leadId).catch(e => console.error('[ERRO]', leadId, e.message));
+      if (delay) setTimeout(executar, delay);
+      else executar();
+    };
+
+    // Novo lead adicionado
+    for (const lead of body?.leads?.add || []) {
       if (Number(lead.pipeline_id) !== PIPELINE_ID) continue;
-      console.log(`[ADD_LEAD] Lead ${lead.id}`);
-      await processarLead(lead.id, lead.name || '');
+      console.log(`[WEBHOOK] Novo lead: ${lead.id}`);
+      agendarProcessamento(lead.id, 2000); // 2s para garantir que dados estão salvos
     }
 
-    // Evento: talk atualizado (nova mensagem WhatsApp)
-    const talksUpdate = body?.talks?.update || [];
-    for (const talk of talksUpdate) {
+    // Nova mensagem no chat (talk adicionado ou atualizado)
+    for (const talk of [...(body?.talks?.add || []), ...(body?.talks?.update || [])]) {
       const leadId = talk.entity_id || talk.lead_id;
-      if (!leadId) continue;
-      // Loga payload completo para diagnóstico (sem truncar)
-      console.log(`[UPDATE_TALK] Payload:`, JSON.stringify(talk));
-      // Tenta extrair texto da mensagem diretamente do payload do webhook
-      const textoMsg = talk.message?.text || talk.last_message || talk.params?.text || '';
-      console.log(`[UPDATE_TALK] lead ${leadId} | msg extraída: "${textoMsg.substring(0, 200)}"`);
-      // Aguarda 3s para garantir que a mensagem foi gravada no sistema
-      setTimeout(() => processarLead(leadId, textoMsg), 3000);
-    }
-
-    // Evento: novo talk criado (primeira mensagem de nova conversa)
-    const talksAdd = body?.talks?.add || [];
-    for (const talk of talksAdd) {
-      const leadId = talk.entity_id || talk.lead_id;
-      if (!leadId) continue;
-      console.log(`[ADD_TALK] Payload:`, JSON.stringify(talk));
-      const textoMsg = talk.message?.text || talk.last_message || talk.params?.text || '';
-      console.log(`[ADD_TALK] lead ${leadId} | msg extraída: "${textoMsg.substring(0, 200)}"`);
-      setTimeout(() => processarLead(leadId, textoMsg), 3000);
+      console.log(`[WEBHOOK] Talk evento | lead ${leadId}`);
+      agendarProcessamento(leadId, 3000); // 3s para garantir que mensagem foi gravada
     }
   } catch (err) {
-    console.error('[ERRO]', err.message);
+    console.error('[WEBHOOK ERRO]', err.message);
   }
 });
 
-// ─── POLLING: verifica leads novos a cada 45 segundos ─────────────────────
-const leadsProcessados = new Set();
+// ─── POLLING (fallback para plano sem webhooks) ─────────────────────────────
+const jaProcessados = new Set(); // Controla quais leads/estado já foram processados
 
 async function polling() {
   try {
-    // Janela de 30 min para capturar leads WABA que demoram para aparecer
     const trintaMinAtras = Math.floor(Date.now() / 1000) - 1800;
-    const res = await fetch(
-      `${BASE}/leads?filter[pipeline_id]=${PIPELINE_ID}&filter[status_id]=${ETAPA_ENTRADA}&filter[created_at][from]=${trintaMinAtras}&limit=50`,
-      { headers: headers() }
-    );
-    if (!res.ok) return;
-    const data = await res.json();
-    const leads = data._embedded?.leads || [];
+    const cincoMinAtras  = Math.floor(Date.now() / 1000) - 300;
 
-    for (const lead of leads) {
-      if (leadsProcessados.has(lead.id)) continue;
-      leadsProcessados.add(lead.id);
-      console.log(`[POLLING] Lead novo detectado: ${lead.id}`);
-      await processarLead(lead.id, lead.name || '');
+    // Busca leads novos em "Etapa de entrada" (últimos 30 min)
+    const r1 = await fetch(
+      `${BASE}/leads?filter[pipeline_id]=${PIPELINE_ID}&filter[status_id]=${ETAPA.ENTRADA}&filter[created_at][from]=${trintaMinAtras}&limit=50`,
+      { headers: hdrs() }
+    );
+    if (r1.ok) {
+      const d1 = await r1.json();
+      for (const lead of d1._embedded?.leads || []) {
+        const chave = `${lead.id}-${lead.updated_at}`;
+        if (jaProcessados.has(chave)) continue;
+        jaProcessados.add(chave);
+        console.log(`[POLL] Novo lead na entrada: ${lead.id}`);
+        await processarLead(lead.id).catch(e => console.error('[POLL ERRO]', lead.id, e.message));
+      }
     }
 
-    // Limpa set após 10 min para não crescer indefinidamente
-    if (leadsProcessados.size > 500) leadsProcessados.clear();
+    // Busca leads atualizados em "Primeiro Contato" (últimos 5 min = cliente respondeu)
+    const r2 = await fetch(
+      `${BASE}/leads?filter[pipeline_id]=${PIPELINE_ID}&filter[status_id]=${ETAPA.PRIMEIRO_CONTATO}&filter[updated_at][from]=${cincoMinAtras}&limit=50`,
+      { headers: hdrs() }
+    );
+    if (r2.ok) {
+      const d2 = await r2.json();
+      for (const lead of d2._embedded?.leads || []) {
+        const chave = `${lead.id}-${lead.updated_at}`;
+        if (jaProcessados.has(chave)) continue;
+        jaProcessados.add(chave);
+        console.log(`[POLL] Resposta do cliente detectada: lead ${lead.id}`);
+        await processarLead(lead.id).catch(e => console.error('[POLL2 ERRO]', lead.id, e.message));
+      }
+    }
+
+    // Limpa cache para evitar crescimento indefinido
+    if (jaProcessados.size > 2000) jaProcessados.clear();
   } catch (err) {
     console.error('[POLLING ERRO]', err.message);
   }
 }
 
-setInterval(polling, 45000);
-console.log('[POLLING] Iniciado — verifica leads novos a cada 45 segundos');
+setInterval(polling, 45000); // Verifica a cada 45 segundos
+console.log('[ANA] Atendente IA iniciada — polling a cada 45 segundos');
 
-// ─── HEALTH CHECK ──────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'kommo-webhook-router' }));
+// ─── HEALTH CHECK ───────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.json({
+  status: 'ok',
+  service: 'atendente-ia-ana',
+  pipeline: PIPELINE_ID,
+  ia: OPENROUTER_KEY ? 'openrouter:configurado' : 'FALTANDO'
+}));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`[SERVER] Porta ${PORT}`));
